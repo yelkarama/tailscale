@@ -1,0 +1,69 @@
+name: Build and Release Tailscale
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    name: Build Tailscale for aarch64
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up latest Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: 'stable'
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+    - name: Build static tailscale binaries for aarch64
+      run: |
+        export GOOS=linux
+        export GOARCH=arm64
+        export CC=aarch64-linux-gnu-gcc
+        export CGO_ENABLED=0
+        export GO_LDFLAGS='-extldflags "-static -Wl,--unresolved-symbols=ignore-in-object-files"'
+        
+        go build -o tailscale -ldflags="-s -w $GO_LDFLAGS" ./cmd/tailscale
+        go build -o tailscaled -ldflags="-s -w $GO_LDFLAGS" ./cmd/tailscaled
+        
+        strip tailscale
+        strip tailscaled
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: tailscale-binaries
+        path: |
+          tailscale
+          tailscaled
+
+  release:
+    name: Release binaries
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: tailscale-binaries
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        name: Release ${{ github.sha }}
+        tag_name: release-${{ github.sha }}
+        files: |
+          tailscale
+          tailscaled
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
