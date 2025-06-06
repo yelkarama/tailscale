@@ -5339,3 +5339,173 @@ func TestSrcCapPacketFilter(t *testing.T) {
 		t.Error("IsDrop() for node without cap = false, want true")
 	}
 }
+
+func TestDisplayMessages(t *testing.T) {
+	b := newTestLocalBackend(t)
+
+	// Pretend we're in a map poll so health updates get processed
+	ht := b.HealthTracker()
+	ht.SetIPNState("NeedsLogin", true)
+	ht.GotStreamedMapResponse()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.setNetMapLocked(&netmap.NetworkMap{
+		DisplayMessages: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+			"test-message": {
+				Title: "Testing",
+			},
+		},
+	})
+
+	state := ht.CurrentState()
+	_, ok := state.Warnings["test-message"]
+
+	if !ok {
+		t.Error("no warning found with id 'test-message'")
+	}
+}
+
+// TestDisplayMessagesURLFilter tests that we filter out any URLs that are not
+// valid as a pop browser URL (see [LocalBackend.validPopBrowserURL]).
+func TestDisplayMessagesURLFilter(t *testing.T) {
+	b := newTestLocalBackend(t)
+
+	// Pretend we're in a map poll so health updates get processed
+	ht := b.HealthTracker()
+	ht.SetIPNState("NeedsLogin", true)
+	ht.GotStreamedMapResponse()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.setNetMapLocked(&netmap.NetworkMap{
+		DisplayMessages: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+			"test-message": {
+				Title:    "Testing",
+				Severity: tailcfg.SeverityHigh,
+				PrimaryAction: &tailcfg.DisplayMessageAction{
+					URL:   "https://www.evil.com",
+					Label: "Phishing Link",
+				},
+			},
+		},
+	})
+
+	state := ht.CurrentState()
+	got, ok := state.Warnings["test-message"]
+
+	if !ok {
+		t.Fatal("no warning found with id 'test-message'")
+	}
+
+	want := health.UnhealthyState{
+		WarnableCode: "test-message",
+		Title:        "Testing",
+		Severity:     health.SeverityHigh,
+	}
+
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("Unexpected message content (-want/+got):\n%s", diff)
+	}
+}
+
+// TestDisplayMessageIPNBus checks that we send health messages appropriately
+// based on whether the watcher has sent the [ipn.NotifyHealthActions] watch
+// option or not.
+func TestDisplayMessageIPNBus(t *testing.T) {
+	type test struct {
+		name        string
+		mask        ipn.NotifyWatchOpt
+		wantWarning health.UnhealthyState
+	}
+
+	msgs := map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+		"test-message": {
+			Title:    "Message title",
+			Text:     "Message text.",
+			Severity: tailcfg.SeverityMedium,
+			PrimaryAction: &tailcfg.DisplayMessageAction{
+				URL:   "https://example.com",
+				Label: "Learn more",
+			},
+		},
+	}
+
+	for _, tt := range []test{
+		{
+			name: "older-client-no-actions",
+			mask: 0,
+			wantWarning: health.UnhealthyState{
+				WarnableCode:  "test-message",
+				Severity:      health.SeverityMedium,
+				Title:         "Message title",
+				Text:          "Message text. Learn more: https://example.com", // PrimaryAction appended to text
+				PrimaryAction: nil,                                             // PrimaryAction not included
+			},
+		},
+		{
+			name: "new-client-with-actions",
+			mask: ipn.NotifyHealthActions,
+			wantWarning: health.UnhealthyState{
+				WarnableCode: "test-message",
+				Severity:     health.SeverityMedium,
+				Title:        "Message title",
+				Text:         "Message text.",
+				PrimaryAction: &health.UnhealthyStateAction{
+					URL:   "https://example.com",
+					Label: "Learn more",
+				},
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			lb := newLocalBackendWithTestControl(t, false, func(tb testing.TB, opts controlclient.Options) controlclient.Client {
+				return newClient(tb, opts)
+			})
+
+			ipnWatcher := newNotificationWatcher(t, lb, nil)
+			ipnWatcher.watch(tt.mask, []wantedNotification{{
+				name: "test",
+				cond: func(_ testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+					if n.Health == nil {
+						return false
+					}
+					got, ok := n.Health.Warnings["test-message"]
+					if ok {
+						if diff := cmp.Diff(tt.wantWarning, got); diff != "" {
+							t.Errorf("unexpected warning details (-want/+got):\n%s", diff)
+							return true // we failed the test so tell the watcher we've seen what we need to to stop it waiting
+						}
+					}
+					return ok
+				},
+			}})
+
+			lb.SetPrefsForTest(&ipn.Prefs{
+				ControlURL:  "https://localhost:1/",
+				WantRunning: true,
+				LoggedOut:   false,
+			})
+			if err := lb.Start(ipn.Options{}); err != nil {
+				t.Fatalf("(*LocalBackend).Start(): %v", err)
+			}
+
+			cc := lb.cc.(*mockControl)
+
+			// Assert that we are logged in and authorized, and also send our DisplayMessages
+			cc.send(nil, "", true, &netmap.NetworkMap{
+				SelfNode:        (&tailcfg.Node{MachineAuthorized: true}).View(),
+				DisplayMessages: msgs,
+			})
+
+			// Tell the health tracker that we are in a map poll because
+			// mockControl doesn't tell it
+			lb.HealthTracker().GotStreamedMapResponse()
+
+			// Assert that we got the expected notification
+			ipnWatcher.check()
+		})
+	}
+}
